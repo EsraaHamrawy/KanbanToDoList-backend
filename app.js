@@ -17,6 +17,10 @@ app.use(
 )
 app.use(express.json({ limit: '1mb' }))
 
+app.get('/', (_req, res) => {
+  res.json({ status: 'ok', message: 'ToDo backend is running' })
+})
+
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok' })
 })
