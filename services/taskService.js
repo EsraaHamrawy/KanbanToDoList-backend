@@ -1,46 +1,20 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import path from 'node:path'
-import { dbFilePath } from '../config/db.js'
-import { buildTaskRecord, validateTaskPayload } from '../models/taskModel.js'
+import { randomUUID } from 'node:crypto'
+import prisma from '../config/prisma.js'
+import { normalizeTaskPayload, validateTaskPayload } from '../models/taskModel.js'
 
-const emptyDatabase = { tasks: [] }
+const nextOrderForColumn = async (column) => {
+  const result = await prisma.task.aggregate({
+    where: { column },
+    _max: { order: true },
+  })
 
-const ensureDatabaseDir = async () => {
-  await mkdir(path.dirname(dbFilePath), { recursive: true })
-}
-
-const readDatabase = async () => {
-  await ensureDatabaseDir()
-
-  try {
-    const raw = await readFile(dbFilePath, 'utf8')
-    return raw.trim() ? JSON.parse(raw) : emptyDatabase
-  } catch (error) {
-    if (error.code === 'ENOENT') {
-      await writeFile(dbFilePath, JSON.stringify(emptyDatabase, null, 2))
-      return emptyDatabase
-    }
-
-    throw error
-  }
-}
-
-const writeDatabase = async (database) => {
-  await ensureDatabaseDir()
-  await writeFile(dbFilePath, JSON.stringify(database, null, 2))
-}
-
-const nextOrderForColumn = (tasks, column) => {
-  const columnOrders = tasks
-    .filter((task) => task.column === column)
-    .map((task) => (Number.isInteger(task.order) ? task.order : 0))
-
-  return (columnOrders.length ? Math.max(...columnOrders) : -1) + 1
+  return (result._max.order ?? -1) + 1
 }
 
 export const getTasks = async () => {
-  const database = await readDatabase()
-  return database.tasks || []
+  return prisma.task.findMany({
+    orderBy: [{ column: 'asc' }, { order: 'asc' }, { createdAt: 'asc' }],
+  })
 }
 
 export const createTask = async (payload) => {
@@ -52,31 +26,38 @@ export const createTask = async (payload) => {
     throw error
   }
 
-  const database = await readDatabase()
-  const task = buildTaskRecord(
-    {
-      ...payload,
-      order: Number.isInteger(payload.order)
-        ? payload.order
-        : nextOrderForColumn(database.tasks || [], payload.column),
-    }
-  )
+  const task = validation.task
+  const order = Number.isInteger(task.order) ? task.order : await nextOrderForColumn(task.column)
+  const id = task.id || randomUUID()
 
-  database.tasks = [...(database.tasks || []), task]
-  await writeDatabase(database)
-
-  return task
+  return prisma.task.create({
+    data: {
+      id,
+      title: task.title,
+      description: task.description,
+      priority: task.priority,
+      column: task.column,
+      order,
+    },
+  })
 }
 
 export const updateTask = async (id, payload) => {
-  const database = await readDatabase()
-  const index = (database.tasks || []).findIndex((task) => task.id === id)
+  const existingTask = await prisma.task.findUnique({ where: { id } })
 
-  if (index === -1) {
+  if (!existingTask) {
     return null
   }
 
-  const nextPayload = { ...database.tasks[index], ...payload, id }
+  const patch = normalizeTaskPayload(payload)
+  const nextPayload = {
+    id,
+    title: patch.title || existingTask.title,
+    description: patch.description || existingTask.description,
+    priority: patch.priority || existingTask.priority,
+    column: patch.column || existingTask.column,
+    order: patch.order ?? existingTask.order,
+  }
   const validation = validateTaskPayload(nextPayload)
 
   if (!validation.isValid) {
@@ -86,24 +67,28 @@ export const updateTask = async (id, payload) => {
     throw error
   }
 
-  const updatedTask = buildTaskRecord(nextPayload, database.tasks[index])
-  database.tasks[index] = updatedTask
+  const task = validation.task
 
-  await writeDatabase(database)
-
-  return updatedTask
+  return prisma.task.update({
+    where: { id },
+    data: {
+      title: task.title,
+      description: task.description,
+      priority: task.priority,
+      column: task.column,
+      order: Number.isInteger(task.order) ? task.order : existingTask.order,
+    },
+  })
 }
 
 export const deleteTask = async (id) => {
-  const database = await readDatabase()
-  const nextTasks = (database.tasks || []).filter((task) => task.id !== id)
+  const existingTask = await prisma.task.findUnique({ where: { id } })
 
-  if (nextTasks.length === (database.tasks || []).length) {
+  if (!existingTask) {
     return false
   }
 
-  database.tasks = nextTasks
-  await writeDatabase(database)
+  await prisma.task.delete({ where: { id } })
 
   return true
 }
