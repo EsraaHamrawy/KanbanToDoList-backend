@@ -30,3 +30,7 @@ export const env = {
       : `https://${rawCorsOrigin}`
     : undefined,
 }
+
+if (env.corsOrigin) {
+  env.corsOrigin = env.corsOrigin.replace(/\/+$/, '')
+}

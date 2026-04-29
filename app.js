@@ -10,9 +10,12 @@ const app = express()
 
 app.disable('x-powered-by')
 app.use(helmet())
+
+const corsOrigin = env.nodeEnv === 'production' ? env.corsOrigin : true
+
 app.use(
   cors({
-    origin: env.corsOrigin || true,
+    origin: corsOrigin,
   })
 )
 app.use(express.json({ limit: '1mb' }))
