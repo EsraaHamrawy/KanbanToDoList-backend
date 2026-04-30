@@ -6,24 +6,13 @@
   "main": "server.js",
   "scripts": {
     "dev": "nodemon server.js",
-    "build": "prisma generate",
-    "start": "node server.js",
-    "db:push": "prisma db push",
-    "db:studio": "prisma studio",
-    "db:migrate:dev": "prisma migrate dev",
-    "db:migrate:deploy": "prisma migrate deploy",
-    "render:build": "prisma generate && prisma migrate deploy",
-    "postinstall": "prisma generate"
+    "start": "node server.js"
   },
   "dependencies": {
-    "@prisma/client": "^6.16.3",
     "cors": "^2.8.5",
-    "dotenv": "^17.2.3",
-    "express": "^5.1.0",
-    "helmet": "^8.1.0"
+    "express": "^5.1.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.14",
-    "prisma": "^6.16.3"
+    "nodemon": "^3.1.14"
   }
 }
