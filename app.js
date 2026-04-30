@@ -11,11 +11,28 @@ const app = express()
 app.disable('x-powered-by')
 app.use(helmet())
 
-const corsOrigin = env.nodeEnv === 'production' ? env.corsOrigin : true
+const allowedOrigins = env.nodeEnv === 'production' ? env.corsOrigins : []
+const allowAllOrigins = env.nodeEnv !== 'production'
+
+const corsOptions = {
+  origin(origin, callback) {
+    if (allowAllOrigins || !origin) {
+      callback(null, true)
+      return
+    }
+
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true)
+      return
+    }
+
+    callback(new Error(`CORS blocked for origin: ${origin}`))
+  },
+}
 
 app.use(
   cors({
-    origin: corsOrigin,
+    ...corsOptions,
   })
 )
 app.use(express.json({ limit: '1mb' }))
