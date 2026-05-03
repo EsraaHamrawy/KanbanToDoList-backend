@@ -1,6 +1,9 @@
 import express from 'express'
 import cors from 'cors'
 import { randomUUID } from 'node:crypto'
+import { promises as fs } from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const app = express()
 
@@ -8,6 +11,9 @@ app.use(cors())
 app.use(express.json())
 
 const PORT = Number(process.env.PORT) || 3002
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+const DATA_FILE = path.join(__dirname, 'tasks.json')
 
 const ALLOWED_COLUMNS = new Set(['backlog', 'in_progress', 'review', 'done'])
 const ALLOWED_PRIORITIES = new Set(['High', 'Medium', 'Low'])
@@ -40,9 +46,34 @@ const nextOrderForColumn = (column) => {
   return (orders.length > 0 ? Math.max(...orders) : -1) + 1
 }
 
-// Temporary in-memory storage
-// Data resets whenever server restarts
 const tasks = []
+
+const loadTasksFromFile = async () => {
+  try {
+    const fileContent = await fs.readFile(DATA_FILE, 'utf-8')
+    const parsed = JSON.parse(fileContent)
+
+    if (!Array.isArray(parsed)) return
+
+    tasks.splice(0, tasks.length, ...parsed)
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      await fs.writeFile(DATA_FILE, '[]', 'utf-8')
+      return
+    }
+
+    console.error('Failed to load tasks from file:', error)
+  }
+}
+
+const saveTasksToFile = async () => {
+  try {
+    await fs.writeFile(DATA_FILE, JSON.stringify(tasks, null, 2), 'utf-8')
+  } catch (error) {
+    console.error('Failed to save tasks to file:', error)
+    throw error
+  }
+}
 
 app.get('/', (_req, res) => {
   res.json({ message: 'Simple Node.js Tasks API is running' })
@@ -81,7 +112,7 @@ app.get('/tasks/:id', (req, res) => {
 })
 
 // POST /tasks
-app.post('/tasks', (req, res) => {
+app.post('/tasks', async (req, res) => {
   const { title = '', description = '', column, priority, order } = req.body || {}
 
   if (!title || typeof title !== 'string') {
@@ -117,12 +148,18 @@ app.post('/tasks', (req, res) => {
     updatedAt: new Date().toISOString(),
   }
 
-  tasks.push(newTask)
-  res.status(201).json(newTask)
+  try {
+    tasks.push(newTask)
+    await saveTasksToFile()
+    res.status(201).json(newTask)
+  } catch (_error) {
+    tasks.pop()
+    res.status(500).json({ message: 'Failed to save task' })
+  }
 })
 
 // PUT /tasks/:id
-app.put('/tasks/:id', (req, res) => {
+app.put('/tasks/:id', async (req, res) => {
   const index = tasks.findIndex((item) => item.id === req.params.id)
 
   if (index === -1) {
@@ -176,12 +213,20 @@ app.put('/tasks/:id', (req, res) => {
     updatedAt: new Date().toISOString(),
   }
 
-  tasks[index] = updatedTask
-  res.json(updatedTask)
+  const previousTask = tasks[index]
+
+  try {
+    tasks[index] = updatedTask
+    await saveTasksToFile()
+    res.json(updatedTask)
+  } catch (_error) {
+    tasks[index] = previousTask
+    res.status(500).json({ message: 'Failed to update task' })
+  }
 })
 
 // DELETE /tasks/:id
-app.delete('/tasks/:id', (req, res) => {
+app.delete('/tasks/:id', async (req, res) => {
   const index = tasks.findIndex((item) => item.id === req.params.id)
 
   if (index === -1) {
@@ -189,10 +234,26 @@ app.delete('/tasks/:id', (req, res) => {
     return
   }
 
-  tasks.splice(index, 1)
-  res.status(204).send()
+  const [deletedTask] = tasks.splice(index, 1)
+
+  try {
+    await saveTasksToFile()
+    res.status(204).send()
+  } catch (_error) {
+    tasks.splice(index, 0, deletedTask)
+    res.status(500).json({ message: 'Failed to delete task' })
+  }
 })
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`)
+const startServer = async () => {
+  await loadTasksFromFile()
+
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`)
+  })
+}
+
+startServer().catch((error) => {
+  console.error('Unable to start server:', error)
+  process.exit(1)
 })
