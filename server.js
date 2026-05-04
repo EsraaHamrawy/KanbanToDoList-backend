@@ -1,9 +1,7 @@
 import express from 'express'
 import cors from 'cors'
 import { randomUUID } from 'node:crypto'
-import { promises as fs } from 'node:fs'
-import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import mongoose from 'mongoose'
 
 const app = express()
 
@@ -11,9 +9,7 @@ app.use(cors())
 app.use(express.json())
 
 const PORT = Number(process.env.PORT) || 3002
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
-const DATA_FILE = path.join(__dirname, 'tasks.json')
+const DATABASE_URL = process.env.DATABASE_URL
 
 const ALLOWED_COLUMNS = new Set(['backlog', 'in_progress', 'review', 'done'])
 const ALLOWED_PRIORITIES = new Set(['High', 'Medium', 'Low'])
@@ -41,38 +37,42 @@ const normalizePriority = (value) => {
 
 const normalizeOrder = (value, fallback = 0) => (Number.isInteger(value) ? value : fallback)
 
-const nextOrderForColumn = (column) => {
-  const orders = tasks.filter((task) => task.column === column).map((task) => task.order)
-  return (orders.length > 0 ? Math.max(...orders) : -1) + 1
-}
+const taskSchema = new mongoose.Schema(
+  {
+    id: { type: String, required: true, unique: true, index: true },
+    title: { type: String, required: true, trim: true },
+    description: { type: String, default: '', trim: true },
+    priority: { type: String, enum: [...ALLOWED_PRIORITIES], default: 'Medium' },
+    column: { type: String, enum: [...ALLOWED_COLUMNS], default: 'backlog', index: true },
+    order: { type: Number, default: 0 },
+    completed: { type: Boolean, default: false },
+    createdAt: { type: String, required: true },
+    updatedAt: { type: String, required: true },
+  },
+  { versionKey: false }
+)
 
-const tasks = []
+const TaskModel = mongoose.model('Task', taskSchema)
 
-const loadTasksFromFile = async () => {
-  try {
-    const fileContent = await fs.readFile(DATA_FILE, 'utf-8')
-    const parsed = JSON.parse(fileContent)
+const mapTask = (taskDoc) => {
+  const plain = taskDoc.toObject ? taskDoc.toObject() : taskDoc
+  const column = normalizeColumn(plain.column, plain.completed)
 
-    if (!Array.isArray(parsed)) return
-
-    tasks.splice(0, tasks.length, ...parsed)
-  } catch (error) {
-    if (error.code === 'ENOENT') {
-      await fs.writeFile(DATA_FILE, '[]', 'utf-8')
-      return
-    }
-
-    console.error('Failed to load tasks from file:', error)
+  return {
+    ...plain,
+    id: plain.id,
+    title: plain.title,
+    description: plain.description,
+    priority: normalizePriority(plain.priority),
+    column,
+    order: normalizeOrder(plain.order),
+    completed: column === 'done',
   }
 }
 
-const saveTasksToFile = async () => {
-  try {
-    await fs.writeFile(DATA_FILE, JSON.stringify(tasks, null, 2), 'utf-8')
-  } catch (error) {
-    console.error('Failed to save tasks to file:', error)
-    throw error
-  }
+const nextOrderForColumn = async (column) => {
+  const topTask = await TaskModel.findOne({ column }).sort({ order: -1 }).lean()
+  return (topTask?.order ?? -1) + 1
 }
 
 app.get('/', (_req, res) => {
@@ -80,35 +80,36 @@ app.get('/', (_req, res) => {
 })
 
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok' })
+  res.json({ status: 'ok', dbState: mongoose.connection.readyState })
 })
 
 // GET /tasks
-app.get('/tasks', (_req, res) => {
-  const normalizedTasks = tasks.map((task) => {
-    const column = normalizeColumn(task.column, task.completed)
-    return {
-      ...task,
-      column,
-      priority: normalizePriority(task.priority),
-      order: normalizeOrder(task.order),
-      completed: column === 'done',
-    }
-  })
-
-  res.json(normalizedTasks)
+app.get('/tasks', async (_req, res) => {
+  try {
+    const taskDocs = await TaskModel.find().sort({ createdAt: 1 }).lean()
+    const normalizedTasks = taskDocs.map(mapTask)
+    res.json(normalizedTasks)
+  } catch (error) {
+    console.error('Failed to fetch tasks:', error)
+    res.status(500).json({ message: 'Failed to fetch tasks' })
+  }
 })
 
 // GET /tasks/:id
-app.get('/tasks/:id', (req, res) => {
-  const task = tasks.find((item) => item.id === req.params.id)
+app.get('/tasks/:id', async (req, res) => {
+  try {
+    const task = await TaskModel.findOne({ id: req.params.id }).lean()
 
-  if (!task) {
-    res.status(404).json({ message: 'Task not found' })
-    return
+    if (!task) {
+      res.status(404).json({ message: 'Task not found' })
+      return
+    }
+
+    res.json(mapTask(task))
+  } catch (error) {
+    console.error('Failed to fetch task by id:', error)
+    res.status(500).json({ message: 'Failed to fetch task' })
   }
-
-  res.json(task)
 })
 
 // POST /tasks
@@ -135,39 +136,31 @@ app.post('/tasks', async (req, res) => {
     return
   }
 
-  const normalizedColumn = normalizeColumn(column)
-  const newTask = {
-    id: randomUUID(),
-    title: title.trim(),
-    description: typeof description === 'string' ? description.trim() : '',
-    priority: normalizePriority(priority),
-    column: normalizedColumn,
-    order: normalizeOrder(order, nextOrderForColumn(normalizedColumn)),
-    completed: normalizedColumn === 'done',
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  }
-
   try {
-    tasks.push(newTask)
-    await saveTasksToFile()
-    res.status(201).json(newTask)
-  } catch (_error) {
-    tasks.pop()
+    const normalizedColumn = normalizeColumn(column)
+    const now = new Date().toISOString()
+    const nextOrder = normalizeOrder(order, await nextOrderForColumn(normalizedColumn))
+
+    const newTask = await TaskModel.create({
+      id: randomUUID(),
+      title: title.trim(),
+      description: typeof description === 'string' ? description.trim() : '',
+      priority: normalizePriority(priority),
+      column: normalizedColumn,
+      order: nextOrder,
+      completed: normalizedColumn === 'done',
+      createdAt: now,
+      updatedAt: now,
+    })
+
+    res.status(201).json(mapTask(newTask))
+  } catch (error) {
+    console.error('Failed to save task:', error)
     res.status(500).json({ message: 'Failed to save task' })
   }
 })
 
-// PUT /tasks/:id
-app.put('/tasks/:id', async (req, res) => {
-  const index = tasks.findIndex((item) => item.id === req.params.id)
-
-  if (index === -1) {
-    res.status(404).json({ message: 'Task not found' })
-    return
-  }
-
-  const currentTask = tasks[index]
+const updateTaskHandler = async (req, res) => {
   const { title, description, completed, column, priority, order } = req.body || {}
 
   if (title !== undefined && typeof title !== 'string') {
@@ -200,53 +193,84 @@ app.put('/tasks/:id', async (req, res) => {
     return
   }
 
-  const normalizedColumn = normalizeColumn(column, completed !== undefined ? completed : currentTask.completed)
-
-  const updatedTask = {
-    ...currentTask,
-    title: title !== undefined ? title.trim() : currentTask.title,
-    description: description !== undefined ? description.trim() : currentTask.description,
-    priority: priority !== undefined ? normalizePriority(priority) : normalizePriority(currentTask.priority),
-    column: normalizedColumn,
-    order: normalizeOrder(order, currentTask.order ?? nextOrderForColumn(normalizedColumn)),
-    completed: normalizedColumn === 'done',
-    updatedAt: new Date().toISOString(),
-  }
-
-  const previousTask = tasks[index]
-
   try {
-    tasks[index] = updatedTask
-    await saveTasksToFile()
-    res.json(updatedTask)
-  } catch (_error) {
-    tasks[index] = previousTask
+    const currentTask = await TaskModel.findOne({ id: req.params.id }).lean()
+
+    if (!currentTask) {
+      res.status(404).json({ message: 'Task not found' })
+      return
+    }
+
+    const normalizedColumn = normalizeColumn(column, completed !== undefined ? completed : currentTask.completed)
+    const resolvedOrder =
+      order !== undefined
+        ? order
+        : currentTask.order ?? (await nextOrderForColumn(normalizedColumn))
+
+    const updatedTask = await TaskModel.findOneAndUpdate(
+      { id: req.params.id },
+      {
+        title: title !== undefined ? title.trim() : currentTask.title,
+        description: description !== undefined ? description.trim() : currentTask.description,
+        priority: priority !== undefined ? normalizePriority(priority) : normalizePriority(currentTask.priority),
+        column: normalizedColumn,
+        order: normalizeOrder(resolvedOrder),
+        completed: normalizedColumn === 'done',
+        updatedAt: new Date().toISOString(),
+      },
+      { new: true }
+    ).lean()
+
+    res.json(mapTask(updatedTask))
+  } catch (error) {
+    console.error('Failed to update task:', error)
     res.status(500).json({ message: 'Failed to update task' })
   }
-})
+}
+
+// PUT /tasks/:id
+app.put('/tasks/:id', updateTaskHandler)
+
+// PATCH /tasks/:id
+app.patch('/tasks/:id', updateTaskHandler)
 
 // DELETE /tasks/:id
 app.delete('/tasks/:id', async (req, res) => {
-  const index = tasks.findIndex((item) => item.id === req.params.id)
-
-  if (index === -1) {
-    res.status(404).json({ message: 'Task not found' })
-    return
-  }
-
-  const [deletedTask] = tasks.splice(index, 1)
-
   try {
-    await saveTasksToFile()
+    const deleteResult = await TaskModel.deleteOne({ id: req.params.id })
+
+    if (deleteResult.deletedCount === 0) {
+      res.status(404).json({ message: 'Task not found' })
+      return
+    }
+
     res.status(204).send()
-  } catch (_error) {
-    tasks.splice(index, 0, deletedTask)
+  } catch (error) {
+    console.error('Failed to delete task:', error)
     res.status(500).json({ message: 'Failed to delete task' })
   }
 })
 
 const startServer = async () => {
-  await loadTasksFromFile()
+  if (!DATABASE_URL) {
+    throw new Error('DATABASE_URL is missing. Set it in environment variables.')
+  }
+
+  mongoose.connection.on('connected', () => {
+    console.log('Database connected')
+  })
+
+  mongoose.connection.on('error', (error) => {
+    console.error('Database connection error:', error)
+  })
+
+  mongoose.connection.on('disconnected', () => {
+    console.warn('Database disconnected')
+  })
+
+  await mongoose.connect(DATABASE_URL, {
+    serverSelectionTimeoutMS: 10000,
+  })
 
   app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`)
